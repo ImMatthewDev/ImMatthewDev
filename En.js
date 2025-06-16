@@ -30,7 +30,7 @@ function App() {
     const [editingForm, setEditingForm] = useState(null);
     const [modal, setModal] = useState({ show: false, text: '' });
 
-    // --- FUNCIONES Y MANEJADORES ---
+    // --- FUNCIONES Y MANEJADORES (Definidos en el nivel superior para cumplir las reglas de Hooks) ---
     const handleLogout = useCallback(() => {
         auth.signOut().catch(error => console.error("Error al cerrar sesión:", error));
     }, []);
@@ -52,9 +52,9 @@ function App() {
         if (!response.ok) throw new Error(resData.message || 'Ocurrió un error en el servidor.');
         return resData;
     }, [user, handleLogout]);
-    
+
     const handleRefreshGuilds = useCallback(() => {
-        setGuilds([]);
+        setGuilds([]); // Limpia la lista actual, lo que activará el useEffect para buscar de nuevo.
     }, []);
 
     // --- EFECTOS DE CICLO DE VIDA ---
@@ -69,7 +69,6 @@ function App() {
 
     useEffect(() => {
         const fetchGuilds = async () => {
-            if (!user || guilds.length > 0) return;
             setLoadingGuilds(true);
             try {
                 const data = await apiRequest('/api/guilds', 'GET');
@@ -83,7 +82,9 @@ function App() {
                 setLoadingGuilds(false);
             }
         };
-        fetchGuilds();
+        if (user && guilds.length === 0) {
+            fetchGuilds();
+        }
     }, [user, guilds.length, apiRequest]);
 
     useEffect(() => {
@@ -97,10 +98,12 @@ function App() {
         return () => { unsubApps(); unsubForms(); };
     }, [selectedGuild]);
 
+    // --- MANEJADORES ---
     const handleSelectGuild = (guild) => { setSelectedGuild(guild); setView(guild.isAdmin ? 'applications' : 'submitForm'); };
     const handleBackToGuilds = () => setSelectedGuild(null);
     const handleSelectApp = (app) => { setSelectedApp(app); setView('review'); };
 
+    // --- LÓGICA DE NEGOCIO ---
     const handleApplicationSubmit = async (answers, form) => {
         if (!user || !form || !selectedGuild) return;
         try {
@@ -114,9 +117,7 @@ function App() {
     const handleApplicationDecision = async (decision, application, sendDm) => {
         if (!application || !selectedGuild || !user) return;
         try {
-            // **CORRECCIÓN**: La única acción de escritura es llamar al backend. No hay 'updateDoc' aquí.
             await apiRequest(`/api/guilds/${selectedGuild.id}/applications/${application.id}`, 'PUT', { guildId: selectedGuild.id, status: decision });
-            
             let finalModalMessage = `Decisión guardada.`;
             const formUsed = forms.find(f => f.id === application.formId);
 
@@ -143,7 +144,6 @@ function App() {
                 await apiRequest(`/api/notify-user`, 'POST', { memberId: application.userId, message });
                 finalModalMessage += ' Notificación enviada.';
             }
-            
             setModal({ show: true, text: finalModalMessage });
             setView('applications');
         } catch (error) { setModal({ show: true, text: `Error: ${error.message}` }); }
@@ -170,7 +170,7 @@ function App() {
         catch(error) { setModal({show: true, text: `Error: ${error.message}`}); }
     };
 
-    // **RENDERIZADO FINAL Y COMPLETO**
+    // --- RENDERIZADO CONDICIONAL (COMPLETO Y FUNCIONAL) ---
     const renderDashboardView = () => {
         if (!selectedGuild) return null;
         const canAccessAdminView = selectedGuild.isAdmin;
@@ -207,4 +207,4 @@ function App() {
 
 export default App;
 
-		
+			
