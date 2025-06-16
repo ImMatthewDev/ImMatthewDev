@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 // **CORRECCIÓN**: Se eliminaron todas las importaciones de Firebase que ya no se usan en el frontend.
 import { db, auth } from './firebase/config';
 import { collection, onSnapshot } from 'firebase/firestore';
@@ -34,6 +34,31 @@ function App() {
 
     const handleLogout = () => auth.signOut();
 
+    // --- MANEJADORES ---
+    const handleSelectGuild = (guild) => {
+        setSelectedGuild(guild);
+        setView(guild.isAdmin ? 'applications' : 'submitForm');
+    };
+    const handleBackToGuilds = () => setSelectedGuild(null);
+    const handleSelectApp = (app) => {
+        setSelectedApp(app);
+        setView('review');
+    };
+
+    // --- LÓGICA DE API ---
+    const apiRequest = useCallback(async (endpoint, method, body) => {
+        if (!user) throw new Error("Usuario no autenticado.");
+        const idToken = await user.getIdToken();
+        const response = await fetch(`${process.env.REACT_APP_BACKEND_URL}${endpoint}`, {
+            method,
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${idToken}` },
+            body: body ? JSON.stringify(body) : undefined
+        });
+        const resData = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(resData.message || 'Ocurrió un error en el servidor.');
+        return resData;
+    }, [user]);
+
     // --- EFECTOS DE CICLO DE VIDA ---
     useEffect(() => {
         const params = new URLSearchParams(window.location.search);
@@ -53,33 +78,26 @@ function App() {
     }, []);
 
     useEffect(() => {
-        if (user && guilds.length === 0 && !loadingGuilds) {
+        const fetchGuilds = async () => {
             setLoadingGuilds(true);
-            user.getIdToken()
-                .then(idToken => fetch(`${process.env.REACT_APP_BACKEND_URL}/api/guilds`, { headers: { 'Authorization': `Bearer ${idToken}` } }))
-                .then(res => {
-                    if (res.status === 429) {
-                         setModal({show: true, text: 'Has hecho demasiadas peticiones. Por favor, espera unos minutos y reinicia sesión.'});
-                         return Promise.reject(new Error('Rate Limited'));
-                    }
-                    if (!res.ok) return res.json().then(err => Promise.reject(err));
-                    return res.json();
-                })
-                .then(data => setGuilds(data))
-                .catch(error => { 
-                    console.error("Guilds Fetch Error:", error.message || error); 
-                    if (String(error.message).includes('401')) {
-                        setModal({show: true, text: 'Tu sesión de Discord ha expirado. Por favor, cierra sesión y vuelve a entrar.'});
-                    }
-                })
-                .finally(() => setLoadingGuilds(false));
+            try {
+                const data = await apiRequest('/api/guilds', 'GET');
+                setGuilds(data);
+            } catch (error) {
+                console.error("Error al obtener servidores:", error.message);
+                setModal({show: true, text: `Error: ${error.message}`});
+            } finally {
+                setLoadingGuilds(false);
+            }
+        };
+        if (user && guilds.length === 0) {
+            fetchGuilds();
         }
-    }, [user, guilds.length, loadingGuilds]);
+    }, [user, guilds.length, apiRequest]);
 
     useEffect(() => {
         if (!selectedGuild) return;
         const guildId = selectedGuild.id;
-        // La lectura de datos sigue ocurriendo en tiempo real desde el frontend
         const appsPath = `guilds/${guildId}/applications`;
         const formsPath = `guilds/${guildId}/forms`;
 
@@ -92,37 +110,19 @@ function App() {
         return () => { unsubApps(); unsubForms(); };
     }, [selectedGuild]);
 
-    // --- MANEJADORES ---
-    const handleSelectGuild = (guild) => {
-        setSelectedGuild(guild);
-        setView(guild.isAdmin ? 'applications' : 'submitForm');
-    };
-    const handleBackToGuilds = () => setSelectedGuild(null);
-    const handleSelectApp = (app) => {
-        setSelectedApp(app);
-        setView('review');
-    };
-
-    // --- LÓGICA DE NEGOCIO (Mediante API) ---
-    const apiRequest = async (endpoint, method, body) => {
-        if (!user) throw new Error("Usuario no autenticado.");
-        const idToken = await user.getIdToken();
-        const response = await fetch(`${process.env.REACT_APP_BACKEND_URL}${endpoint}`, {
-            method,
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${idToken}` },
-            body: body ? JSON.stringify(body) : undefined
-        });
-        const resData = await response.json();
-        if (!response.ok) throw new Error(resData.message || 'Ocurrió un error en el servidor.');
-        return resData;
-    };
-
+    // --- LÓGICA DE NEGOCIO ---
     const handleApplicationSubmit = async (answers, form) => {
+        if (!user || !form || !selectedGuild) return;
         try {
-            await apiRequest(`/api/guilds/${selectedGuild.id}/applications`, 'POST', { submission: { userId: user.uid, userName: user.displayName, userAvatar: user.photoURL, formId: form.id, formTitle: form.title, questions: form.questions.map(q => ({...q, answer: answers[q.id] || '' })) } });
+            const submission = {
+                userId: user.uid, userName: user.displayName, userAvatar: user.photoURL,
+                formId: form.id, formTitle: form.title,
+                questions: form.questions.map(q => ({...q, answer: answers[q.id] || '' }))
+            };
+            await apiRequest(`/api/guilds/${selectedGuild.id}/applications`, 'POST', { submission });
             if (form.notificationChannelId) {
                 const embed = { title: `Nueva Postulación Recibida: ${form.title}`, description: `Enviada por **${user.displayName}**.`, color: 0x5865F2, timestamp: new Date().toISOString() };
-                await apiRequest(`/api/send-webhook`, 'POST', { channelId: form.notificationChannelId, embed });
+                await apiRequest(`/api/send-webhook`, 'POST', { guildId: selectedGuild.id, channelId: form.notificationChannelId, embed });
             }
             setModal({show: true, text: "Tu postulación fue enviada correctamente."});
             setView('submitForm');
@@ -130,18 +130,32 @@ function App() {
     };
 
     const handleApplicationDecision = async (decision, application, sendDm) => {
+        if (!application || !selectedGuild || !user) return;
         try {
             await apiRequest(`/api/guilds/${selectedGuild.id}/applications/${application.id}`, 'PUT', { status: decision });
             let finalModalMessage = `Decisión guardada.`;
             const formUsed = forms.find(f => f.id === application.formId);
 
-            if (decision === 'Accepted' && selectedGuild.isPremium && formUsed?.rolesToAssign?.length > 0) {
-                 await apiRequest(`/api/assign-roles`, 'POST', { guildId: selectedGuild.id, memberId: application.userId, roles: formUsed.rolesToAssign.filter(r => r) });
-                 finalModalMessage += ' Roles asignados.';
+            const rolesToAssign = (decision === 'Accepted' && formUsed?.rolesOnAccept) || [];
+            const rolesToRemove = (decision === 'Rejected' && formUsed?.rolesOnReject) || [];
+            
+            if (selectedGuild.isPremium && rolesToAssign.length > 0) {
+                 await apiRequest(`/api/assign-roles`, 'POST', { guildId: selectedGuild.id, memberId: application.userId, roles: rolesToAssign.filter(r => r) });
+                 finalModalMessage += ' Roles de aceptación asignados.';
+            } else if (decision === 'Accepted' && formUsed?.roleToAssign) {
+                 await apiRequest(`/api/assign-roles`, 'POST', { guildId: selectedGuild.id, memberId: application.userId, roles: [formUsed.roleToAssign] });
+                 finalModalMessage += ' Rol asignado.';
             }
+
+            if (selectedGuild.isPremium && rolesToRemove.length > 0) {
+                 await apiRequest(`/api/remove-roles`, 'POST', { guildId: selectedGuild.id, memberId: application.userId, roles: rolesToRemove.filter(r => r) });
+                 finalModalMessage += ' Roles de rechazo quitados.';
+            }
+
             if (sendDm) {
                 const serverName = guilds.find(g => g.id === selectedGuild.id)?.name || 'el servidor';
-                let message = `¡Hola! Tu postulación para "${application.formTitle}" en **${serverName}** ha sido **${decision === 'Accepted' ? 'Aceptada' : 'Rechazada'}**.`;
+                const template = decision === 'Accepted' ? formUsed?.dmTemplateAccept : formUsed?.dmTemplateReject;
+                const message = (selectedGuild.isPremium && template) ? template.replace(/{userName}/g, application.userName).replace(/{serverName}/g, serverName).replace(/{formTitle}/g, application.formTitle) : `¡Hola! Tu postulación para "${application.formTitle}" en **${serverName}** ha sido **${decision === 'Accepted' ? 'Aceptada' : 'Rechazada'}**.`;
                 await apiRequest(`/api/notify-user`, 'POST', { memberId: application.userId, message });
                 finalModalMessage += ' Notificación enviada.';
             }
@@ -149,7 +163,7 @@ function App() {
             setView('applications');
         } catch (error) { setModal({ show: true, text: `Error: ${error.message}` }); }
     };
-    
+
     const handleSaveForm = async (formToSave) => {
         try {
             const endpoint = formToSave.id ? `/api/guilds/${selectedGuild.id}/forms/${formToSave.id}` : `/api/guilds/${selectedGuild.id}/forms`;
@@ -161,19 +175,14 @@ function App() {
     
     const handleDeleteForm = async (formId) => {
         if (window.confirm("¿Seguro que quieres eliminar este formulario?")) {
-            try {
-                await apiRequest(`/api/guilds/${selectedGuild.id}/forms/${formId}`, 'DELETE');
-                setModal({ show: true, text: "Formulario eliminado." });
-            } catch (error) { setModal({ show: true, text: `Error: ${error.message}` }); }
+            try { await apiRequest(`/api/guilds/${selectedGuild.id}/forms/${formId}`, 'DELETE'); setModal({ show: true, text: "Formulario eliminado." }); }
+            catch (error) { setModal({ show: true, text: `Error: ${error.message}` }); }
         }
     };
     
     const handleActivatePremium = async (isPremium) => {
-        try {
-            await apiRequest(`/api/set-premium`, 'POST', { guildId: selectedGuild.id, isPremium });
-            setSelectedGuild(g => ({...g, isPremium}));
-            setModal({show: true, text: `Plan Premium ${isPremium ? 'activado' : 'desactivado'}.`});
-        } catch(error) { setModal({show: true, text: `Error: ${error.message}`}); }
+        try { await apiRequest(`/api/set-premium`, 'POST', { guildId: selectedGuild.id, isPremium }); setSelectedGuild(g => ({...g, isPremium})); setModal({show: true, text: `Plan Premium ${isPremium ? 'activado' : 'desactivado'}.`}); }
+        catch(error) { setModal({show: true, text: `Error: ${error.message}`}); }
     };
 
     // --- RENDERIZADO CONDICIONAL ---
@@ -181,7 +190,7 @@ function App() {
         if (!selectedGuild) return null;
         const canAccessAdminView = selectedGuild.isAdmin;
         switch (view) {
-            case 'applications': return canAccessAdminView ? <ApplicationsList applications={applications} onSelectApp={handleSelectApp} /> : <p>No tienes permiso.</p>;
+            case 'applications': return canAccessAdminView ? <ApplicationsList applications={applications} onSelectApp={handleSelectApp} /> : <p>No tienes permiso para ver esta página.</p>;
             case 'review': return canAccessAdminView ? <ApplicationReview app={selectedApp} onDecision={(decision, sendDm) => handleApplicationDecision(decision, selectedApp, sendDm)} /> : <p>No tienes permiso.</p>;
             case 'forms': return canAccessAdminView ? <FormList forms={forms} onEditForm={(f) => {setEditingForm(f); setView('editForm');}} onCreateForm={() => {setEditingForm(null); setView('editForm')}} onDeleteForm={handleDeleteForm} /> : <p>No tienes permiso.</p>;
             case 'editForm': return canAccessAdminView ? <FormEditor initialForm={editingForm} onSave={handleSaveForm} onCancel={() => setView('forms')} isPremium={selectedGuild.isPremium} guildId={selectedGuild.id} user={user} /> : <p>No tienes permiso.</p>;
@@ -206,3 +215,4 @@ function App() {
 
 export default App;
 
+                
