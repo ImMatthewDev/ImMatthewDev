@@ -1,4 +1,4 @@
-// --- IMPORTACIONESj ---
+// --- IMPORTACIONES g---
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -73,18 +73,11 @@ app.get('/auth/callback', async (req, res) => {
         const { access_token } = tokenResponse.data;
         const userResponse = await axios.get('https://discord.com/api/users/@me', { headers: { Authorization: `Bearer ${access_token}` } });
         const { id: uid, username, avatar } = userResponse.data;
-
         userAccessTokens.set(uid, access_token);
-
         const userGuildsResponse = await axios.get('https://discord.com/api/users/@me/guilds', { headers: { Authorization: `Bearer ${access_token}` } });
-        const adminGuildIds = userGuildsResponse.data
-            .filter(g => new PermissionsBitField(BigInt(g.permissions)).has(PermissionsBitField.Flags.Administrator))
-            .map(g => g.id);
-        
+        const adminGuildIds = userGuildsResponse.data.filter(g => new PermissionsBitField(BigInt(g.permissions)).has(PermissionsBitField.Flags.Administrator)).map(g => g.id);
         await db.collection('users').doc(uid).collection('private').doc('permissions').set({ adminGuilds: adminGuildIds }, { merge: true });
-
         await admin.auth().updateUser(uid, { displayName: username, photoURL: `https://cdn.discordapp.com/avatars/${uid}/${avatar}.png` }).catch(err => { if (err.code === 'auth/user-not-found') return admin.auth().createUser({ uid, displayName: username, photoURL: `https://cdn.discordapp.com/avatars/${uid}/${avatar}.png` }); throw err; });
-        
         const firebaseToken = await admin.auth().createCustomToken(uid);
         res.redirect(`${process.env.FRONTEND_URL}/login?token=${firebaseToken}`);
     } catch (error) {
@@ -98,26 +91,39 @@ const snowflakeRegex = /^\d{17,19}$/;
 
 app.get('/api/guilds', verifyFirebaseToken, async (req, res) => {
     const uid = req.user.uid;
+    const accessToken = userAccessTokens.get(uid);
+    if (!accessToken) return res.status(401).json({ message: 'Token de Discord expirado. Por favor, re-inicia sesión.' });
+
     try {
-        const userPermsDoc = await db.collection('users').doc(uid).collection('private').doc('permissions').get();
-        const adminGuilds = userPermsDoc.exists ? userPermsDoc.data().adminGuilds || [] : [];
-        const botGuilds = Array.from(client.guilds.cache.values());
+        const userGuildsResponse = await axios.get('https://discord.com/api/users/@me/guilds', { headers: { Authorization: `Bearer ${accessToken}` } });
+        console.log(`[DEBUG] Obtenidos ${userGuildsResponse.data.length} servidores de la API de Discord para el usuario ${uid}`);
+
+        const botGuilds = client.guilds.cache;
         
-        const guildsDataPromises = botGuilds.map(async guild => {
+        const guildsDataPromises = userGuildsResponse.data.map(async guild => {
+            const isAdmin = new PermissionsBitField(BigInt(guild.permissions)).has(PermissionsBitField.Flags.Administrator);
             const settingsDoc = await db.collection('guilds').doc(guild.id).get();
             return {
-                id: guild.id, name: guild.name, icon: guild.icon,
-                isAdmin: adminGuilds.includes(guild.id),
-                isBotMember: true,
+                id: guild.id,
+                name: guild.name,
+                icon: guild.icon,
+                isAdmin,
+                isBotMember: botGuilds.has(guild.id),
                 isPremium: settingsDoc.exists ? settingsDoc.data().isPremium || false : false,
             };
         });
-        res.json(await Promise.all(guildsDataPromises));
+        
+        const finalGuilds = await Promise.all(guildsDataPromises);
+        console.log(`[DEBUG] Enviando ${finalGuilds.length} servidores al frontend.`);
+        res.json(finalGuilds);
+
     } catch (error) {
-        console.error('Guilds Error:', error.message);
-        res.status(500).json({ message: 'Error al obtener los servidores.' });
+        console.error('Guilds Error:', error.response?.data || error.message);
+        userAccessTokens.delete(uid);
+        res.status(401).json({ message: 'El token de Discord ha expirado.' });
     }
 });
+
 
 app.post('/api/guilds/:guildId/applications', verifyFirebaseToken, async (req, res) => {
     const { guildId } = req.params;
