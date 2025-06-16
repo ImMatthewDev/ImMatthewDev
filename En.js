@@ -1,229 +1,206 @@
-import React, { useState, useEffect, useCallback } from 'react';
-// **CORRECCIÓN**: Se eliminaron todas las importaciones de Firebase que ya no se usan en el frontend.
-import { db, auth } from './firebase/config';
-import { collection, onSnapshot } from 'firebase/firestore';
-import { onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+// --- IMPORTACIONES n---
+require('dotenv').config();
+const express = require('express');
+const axios = require('axios');
+const admin = require('firebase-admin');
+const cors = require('cors');
+const { Client, GatewayIntentBits, PermissionsBitField, EmbedBuilder } = require('discord.js');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 
-// Vistas y Componentes
-import Sidebar from './components/Sidebar';
-import Modal from './components/Modal';
-import LoginScreen from './views/LoginScreen';
-import ServerSelectionScreen from './views/ServerSelectionScreen';
-import ApplicationsList from './views/ApplicationsList';
-import ApplicationReview from './views/ApplicationReview';
-import ApplicationForm from './views/ApplicationForm';
-import FormList from './views/FormList';
-import FormEditor from './views/FormEditor';
-import Settings from './views/Settings';
+// --- CONFIGURACIÓN DE EXPRESS Y SEGURIDAD ---
+const app = express();
+app.use(helmet());
+app.use(cors({ origin: process.env.FRONTEND_URL }));
+app.use(express.json());
+const apiLimiter = rateLimit({
+	windowMs: 15 * 60 * 1000, // 15 minutos
+	max: 100, // Limita cada IP a 100 peticiones por ventana de tiempo
+	standardHeaders: true,
+	legacyHeaders: false,
+    message: { message: 'Demasiadas peticiones desde esta IP, por favor intenta de nuevo en 15 minutos.' }
+});
+app.use('/api/', apiLimiter);
 
-function App() {
-    // Estados de autenticación y selección de servidor
-    const [user, setUser] = useState(null);
-    const [loading, setLoading] = useState(true);
-    const [guilds, setGuilds] = useState([]);
-    const [loadingGuilds, setLoadingGuilds] = useState(false);
-    const [selectedGuild, setSelectedGuild] = useState(null);
+// --- INICIALIZACIÓN DE SERVICIOS ---
+admin.initializeApp({
+  credential: admin.credential.cert({
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+  })
+});
+const db = admin.firestore();
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
+client.once('ready', () => console.log(`Bot conectado como ${client.user.tag}!`));
+const userAccessTokens = new Map();
 
-    // Estados de la dashboard
-    const [applications, setApplications] = useState([]);
-    const [forms, setForms] = useState([]);
-    const [view, setView] = useState('applications');
-    const [selectedApp, setSelectedApp] = useState(null);
-    const [editingForm, setEditingForm] = useState(null);
-    const [modal, setModal] = useState({ show: false, text: '' });
+// --- MIDDLEWARES DE SEGURIDAD ---
+const verifyFirebaseToken = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) return res.status(401).send({ message: 'No autorizado.' });
+    try {
+        req.user = await admin.auth().verifyIdToken(authHeader.split('Bearer ')[1]);
+        next();
+    } catch (error) { return res.status(401).send({ message: 'Token de Firebase inválido o expirado.' }); }
+};
 
-    const handleLogout = useCallback(() => {
-        auth.signOut().catch(error => console.error("Error al cerrar sesión:", error));
-    }, []);
+const checkGuildAdmin = async (req, res, next) => {
+    const uid = req.user.uid;
+    const guildId = req.params.guildId || req.body.guildId;
+    if (!guildId) return res.status(400).send({ message: 'No se especificó un ID de servidor.' });
+    try {
+        const userPermsDoc = await db.collection('users').doc(uid).collection('private').doc('permissions').get();
+        if (!userPermsDoc.exists || !userPermsDoc.data().adminGuilds?.includes(guildId)) {
+            return res.status(403).send({ message: 'No tienes permisos de administrador en este servidor.' });
+        }
+        next();
+    } catch (error) { return res.status(500).send({ message: 'No se pudieron verificar los permisos.' }); }
+};
 
-    // Función unificada para hacer peticiones seguras al backend
-    const apiRequest = useCallback(async (endpoint, method, body) => {
-        if (!user) throw new Error("Usuario no autenticado.");
-        const idToken = await user.getIdToken(true); // Forzar refresco del token
-        const response = await fetch(`${process.env.REACT_APP_BACKEND_URL}${endpoint}`, {
-            method,
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${idToken}` },
-            body: body ? JSON.stringify(body) : undefined
-        });
+// --- ENDPOINTS DE AUTENTICACIÓN ---
+app.get('/auth/login', (req, res) => res.redirect(`https://discord.com/api/oauth2/authorize?client_id=${process.env.DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(process.env.DISCORD_REDIRECT_URI)}&response_type=code&scope=identify%20email%20guilds`));
+
+app.get('/auth/callback', async (req, res) => {
+    const { code, error, error_description } = req.query;
+    if (error) { console.error(`Error en callback de Discord: ${error_description}`); return res.redirect(`${process.env.FRONTEND_URL}/login?error=${encodeURIComponent(error_description)}`); }
+    if (!code) { return res.redirect(`${process.env.FRONTEND_URL}/login?error=No_se_recibio_codigo`); }
+    try {
+        const tokenResponse = await axios.post('https://discord.com/api/oauth2/token', new URLSearchParams({ client_id: process.env.DISCORD_CLIENT_ID, client_secret: process.env.DISCORD_CLIENT_SECRET, grant_type: 'authorization_code', code, redirect_uri: process.env.DISCORD_REDIRECT_URI, }), { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+        const { access_token } = tokenResponse.data;
+        const userResponse = await axios.get('https://discord.com/api/users/@me', { headers: { Authorization: `Bearer ${access_token}` } });
+        const { id: uid, username, avatar } = userResponse.data;
+
+        // **CORRECCIÓN**: Obtener los servidores y permisos del usuario DENTRO del callback
+        const userGuildsResponse = await axios.get('https://discord.com/api/users/@me/guilds', { headers: { Authorization: `Bearer ${access_token}` } });
+        const adminGuildIds = userGuildsResponse.data
+            .filter(g => new PermissionsBitField(BigInt(g.permissions)).has(PermissionsBitField.Flags.Administrator))
+            .map(g => g.id);
         
-        if (response.status === 401) {
-            setModal({show: true, text: 'Tu sesión ha expirado. Por favor, inicia sesión de nuevo.'});
-            handleLogout();
-            throw new Error("Sesión expirada");
-        }
+        // Guardar los permisos en Firestore para no depender del token de Discord más tarde
+        await db.collection('users').doc(uid).collection('private').doc('permissions').set({ adminGuilds: adminGuildIds }, { merge: true });
 
-        const resData = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(resData.message || 'Ocurrió un error en el servidor.');
-        return resData;
-    }, [user, handleLogout]);
-
-    // --- EFECTOS DE CICLO DE VIDA ---
-    useEffect(() => {
-        const params = new URLSearchParams(window.location.search);
-        const token = params.get('token');
-        const error = params.get('error');
-
-        if (error) {
-            setModal({ show: true, text: `Error de autenticación: ${error.replace(/_/g, ' ')}` });
-            setLoading(false);
-            window.history.replaceState({}, document.title, "/login");
-            return;
-        }
-
-        if (token) {
-            signInWithCustomToken(auth, token)
-                .catch(err => { console.error("Token Error:", err); setModal({ show: true, text: "Token de inicio de sesión inválido." }); })
-                .finally(() => window.history.replaceState({}, document.title, "/"));
-        }
+        // Actualizar o crear usuario en Firebase Auth
+        await admin.auth().updateUser(uid, { displayName: username, photoURL: `https://cdn.discordapp.com/avatars/${uid}/${avatar}.png` })
+            .catch(err => { if (err.code === 'auth/user-not-found') return admin.auth().createUser({ uid, displayName: username, photoURL: `https://cdn.discordapp.com/avatars/${uid}/${avatar}.png` }); throw err; });
         
-        const unsubscribeAuth = onAuthStateChanged(auth, u => {
-            setUser(u);
-            setLoading(false);
-            if (!u) {
-                setSelectedGuild(null);
-                setGuilds([]);
-            }
+        // Crear token de sesión de Firebase y redirigir
+        const firebaseToken = await admin.auth().createCustomToken(uid);
+        res.redirect(`${process.env.FRONTEND_URL}/login?token=${firebaseToken}`);
+    } catch (error) {
+        console.error('Error crítico en el flujo de autenticación:', error.response?.data || error.message);
+        res.redirect(`${process.env.FRONTEND_URL}/login?error=Fallo_critico_del_servidor`);
+    }
+});
+
+
+// --- ENDPOINTS DE LA API ---
+const snowflakeRegex = /^\d{17,19}$/;
+app.get('/api/guilds', verifyFirebaseToken, async (req, res) => {
+    const uid = req.user.uid;
+    try {
+        const userPermsDoc = await db.collection('users').doc(uid).collection('private').doc('permissions').get();
+        const adminGuilds = userPermsDoc.exists ? userPermsDoc.data().adminGuilds || [] : [];
+        const botGuilds = Array.from(client.guilds.cache.values());
+        
+        const guildsDataPromises = botGuilds.map(async guild => {
+            const settingsDoc = await db.collection('guilds').doc(guild.id).get();
+            return {
+                id: guild.id, name: guild.name, icon: guild.icon,
+                isAdmin: adminGuilds.includes(guild.id),
+                isBotMember: true,
+                isPremium: settingsDoc.exists ? settingsDoc.data().isPremium || false : false,
+            };
         });
-        return () => unsubscribeAuth();
-    }, []);
+        res.json(await Promise.all(guildsDataPromises));
+    } catch (error) {
+        console.error('Guilds Error:', error.message);
+        res.status(500).json({ message: 'Error al obtener los servidores.' });
+    }
+});
 
-    useEffect(() => {
-        const fetchGuilds = async () => {
-            if (!user || guilds.length > 0) return;
-            setLoadingGuilds(true);
-            try {
-                const data = await apiRequest('/api/guilds', 'GET');
-                setGuilds(data);
-            } catch (error) {
-                if (error.message !== "Sesión expirada") {
-                    console.error("Error al obtener servidores:", error.message);
-                    setModal({show: true, text: `Error: ${error.message}`});
-                }
-            } finally {
-                setLoadingGuilds(false);
+app.post('/api/guilds/:guildId/applications', verifyFirebaseToken, async (req, res) => {
+    const { guildId } = req.params; const { submission } = req.body;
+    if (!submission) return res.status(400).send({ message: 'Faltan datos de la postulación.' });
+    try {
+        const dataToSave = { ...submission, date: admin.firestore.FieldValue.serverTimestamp(), status: 'Pending' };
+        await db.collection('guilds').doc(guildId).collection('applications').add(dataToSave);
+        const formDoc = await db.collection('guilds').doc(guildId).collection('forms').doc(submission.formId).get();
+        if (formDoc.exists) {
+            const formData = formDoc.data();
+            if (formData.notificationChannelId && snowflakeRegex.test(formData.notificationChannelId)) {
+                const template = formData.webhookTemplate || `Enviada por **{userName}**.`;
+                const description = template.replace(/{userName}/g, submission.userName).replace(/{formTitle}/g, submission.formTitle);
+                const embed = new EmbedBuilder().setTitle(`Nueva Postulación Recibida: ${submission.formTitle}`).setDescription(description).setColor(0x5865F2).setTimestamp().setAuthor({name: submission.userName, iconURL: submission.userAvatar});
+                try {
+                    const channel = await client.channels.fetch(formData.notificationChannelId);
+                    if (channel?.isTextBased()) await channel.send({ embeds: [embed] });
+                } catch (webhookError) { console.error("Webhook Error (ignorado):", webhookError.message); }
             }
-        };
-        fetchGuilds();
-    }, [user, guilds.length, apiRequest]);
-
-    useEffect(() => {
-        if (!selectedGuild) return;
-        const guildId = selectedGuild.id;
-        const appsPath = `guilds/${guildId}/applications`;
-        const formsPath = `guilds/${guildId}/forms`;
-
-        const unsubApps = onSnapshot(collection(db, appsPath), s => setApplications(s.docs.map(d => ({ ...d.data(), id: d.id })).sort((a,b) => (b.date?.seconds || 0) - (a.date?.seconds || 0))));
-        const unsubForms = onSnapshot(collection(db, formsPath), s => setForms(s.docs.map(d => ({ ...d.data(), id: d.id }))));
-        return () => { unsubApps(); unsubForms(); };
-    }, [selectedGuild]);
-
-    // --- MANEJADORES ---
-    const handleSelectGuild = (guild) => { setSelectedGuild(guild); setView(guild.isAdmin ? 'applications' : 'submitForm'); };
-    const handleBackToGuilds = () => setSelectedGuild(null);
-    const handleSelectApp = (app) => { setSelectedApp(app); setView('review'); };
-
-    // --- LÓGICA DE NEGOCIO ---
-    const handleApplicationSubmit = async (answers, form) => {
-        if (!user || !form || !selectedGuild) return;
-        try {
-            const submission = { userId: user.uid, userName: user.displayName, userAvatar: user.photoURL, formId: form.id, formTitle: form.title, questions: form.questions.map(q => ({...q, answer: answers[q.id] || '' }))};
-            await apiRequest(`/api/guilds/${selectedGuild.id}/applications`, 'POST', { submission });
-            setModal({show: true, text: "Tu postulación fue enviada correctamente."});
-            setView('submitForm');
-        } catch(error) { setModal({ show: true, text: `Error: ${error.message}` }); }
-    };
-
-    const handleApplicationDecision = async (decision, application, sendDm) => {
-        if (!application || !selectedGuild || !user) return;
-        try {
-            await apiRequest(`/api/guilds/${selectedGuild.id}/applications/${application.id}`, 'PUT', { guildId: selectedGuild.id, status: decision });
-            let finalModalMessage = `Decisión guardada.`;
-            const formUsed = forms.find(f => f.id === application.formId);
-
-            const rolesToAdd = (decision === 'Accepted' && formUsed?.rolesOnAccept) || [];
-            const rolesToRemove = (decision === 'Rejected' && formUsed?.rolesOnReject) || [];
-            
-            if (selectedGuild.isPremium && rolesToAdd.length > 0) {
-                 await apiRequest(`/api/assign-roles`, 'POST', { guildId: selectedGuild.id, memberId: application.userId, roles: rolesToAdd.filter(r => r) });
-                 finalModalMessage += ' Roles de aceptación asignados.';
-            } else if (decision === 'Accepted' && formUsed?.roleToAssign) {
-                 await apiRequest(`/api/assign-roles`, 'POST', { guildId: selectedGuild.id, memberId: application.userId, roles: [formUsed.roleToAssign] });
-                 finalModalMessage += ' Rol asignado.';
-            }
-
-            if (selectedGuild.isPremium && rolesToRemove.length > 0) {
-                 await apiRequest(`/api/remove-roles`, 'POST', { guildId: selectedGuild.id, memberId: application.userId, roles: rolesToRemove.filter(r => r) });
-                 finalModalMessage += ' Roles de rechazo quitados.';
-            }
-
-            if (sendDm) {
-                const serverName = guilds.find(g => g.id === selectedGuild.id)?.name || 'el servidor';
-                const template = decision === 'Accepted' ? formUsed?.dmTemplateAccept : formUsed?.dmTemplateReject;
-                const message = (selectedGuild.isPremium && template) ? template.replace(/{userName}/g, application.userName).replace(/{serverName}/g, serverName).replace(/{formTitle}/g, application.formTitle) : `¡Hola! Tu postulación para el formulario "${application.formTitle}" en **${serverName}** ha sido **${decision === 'Accepted' ? 'Aceptada' : 'Rechazada'}**.`;
-                await apiRequest(`/api/notify-user`, 'POST', { memberId: application.userId, message });
-                finalModalMessage += ' Notificación enviada.';
-            }
-            setModal({ show: true, text: finalModalMessage });
-            setView('applications');
-        } catch (error) { setModal({ show: true, text: `Error: ${error.message}` }); }
-    };
-    
-    const handleSaveForm = async (formToSave) => {
-        try {
-            const endpoint = formToSave.id ? `/api/guilds/${selectedGuild.id}/forms/${formToSave.id}` : `/api/guilds/${selectedGuild.id}/forms`;
-            const method = formToSave.id ? 'PUT' : 'POST';
-            await apiRequest(endpoint, method, { form: formToSave });
-            setEditingForm(null); setView('forms'); setModal({ show: true, text: 'Formulario guardado.' });
-        } catch (error) { setModal({ show: true, text: `Error: ${error.message}` }); }
-    };
-    
-    const handleDeleteForm = async (formId) => {
-        if (window.confirm("¿Seguro que quieres eliminar este formulario?")) {
-            try { await apiRequest(`/api/guilds/${selectedGuild.id}/forms/${formId}`, 'DELETE'); setModal({ show: true, text: "Formulario eliminado." }); }
-            catch (error) { setModal({ show: true, text: `Error: ${error.message}` }); }
         }
-    };
-    
-    const handleActivatePremium = async (isPremium) => {
-        try { await apiRequest(`/api/set-premium`, 'POST', { guildId: selectedGuild.id, isPremium }); setSelectedGuild(g => ({...g, isPremium})); setModal({show: true, text: `Plan Premium ${isPremium ? 'activado' : 'desactivado'}.`}); }
-        catch(error) { setModal({show: true, text: `Error: ${error.message}`}); }
-    };
+        res.status(201).send({ message: 'Postulación recibida.' });
+    } catch (error) { console.error("Submit App Error:", error); res.status(500).send({ message: "Error al guardar la postulación." }); }
+});
 
-    // --- RENDERIZADO CONDICIONAL (COMPLETO Y FUNCIONAL) ---
-    const renderDashboardView = () => {
-        if (!selectedGuild) return null;
-        const canAccessAdminView = selectedGuild.isAdmin;
-        switch (view) {
-            case 'applications':
-                return canAccessAdminView ? <ApplicationsList applications={applications} onSelectApp={handleSelectApp} /> : <p>No tienes permiso para ver esta página.</p>;
-            case 'review':
-                return canAccessAdminView ? <ApplicationReview app={selectedApp} onDecision={handleApplicationDecision} /> : <p>No tienes permiso para ver esta página.</p>;
-            case 'forms':
-                return canAccessAdminView ? <FormList forms={forms} onEditForm={(f) => {setEditingForm(f); setView('editForm');}} onCreateForm={() => {setEditingForm(null); setView('editForm')}} onDeleteForm={handleDeleteForm} /> : <p>No tienes permiso para ver esta página.</p>;
-            case 'editForm':
-                return canAccessAdminView ? <FormEditor initialForm={editingForm} onSave={handleSaveForm} onCancel={() => setView('forms')} isPremium={selectedGuild.isPremium} guildId={selectedGuild.id} user={user} /> : <p>No tienes permiso para ver esta página.</p>;
-            case 'submitForm':
-                return <ApplicationForm forms={forms} onSubmit={handleApplicationSubmit} />;
-            case 'settings':
-                return canAccessAdminView ? <Settings guild={selectedGuild} onActivatePremium={handleActivatePremium}/> : <p>No tienes permiso para ver esta página.</p>;
-            default:
-                return <p>Vista no encontrada.</p>;
-        }
-    };
-    
-    if (loading) return <div className="flex justify-center items-center h-screen bg-main"><p>Verificando sesión...</p></div>;
-    if (!user) return <LoginScreen />;
-    if (!selectedGuild) return <ServerSelectionScreen guilds={guilds} user={user} onSelectGuild={handleSelectGuild} onLogout={handleLogout} loading={loadingGuilds} onRefresh={useCallback(() => setGuilds([]), [])}/>;
-    
-    return (
-        <div className="flex h-screen bg-main text-main-text">
-            {modal.show && <Modal text={modal.text} onClose={() => setModal({ show: false, text: '' })} />}
-            <Sidebar setView={setView} activeView={view} user={user} isAdmin={selectedGuild.isAdmin} onLogout={handleLogout} onBack={handleBackToGuilds}/>
-            <main className="flex-1 p-6 md:p-10 overflow-y-auto">{renderDashboardView()}</main>
-        </div>
-    );
-}
+app.put('/api/guilds/:guildId/applications/:appId', verifyFirebaseToken, checkGuildAdmin, async (req, res) => {
+    const { guildId, appId } = req.params; const { status } = req.body;
+    if (!status || !['Accepted', 'Rejected'].includes(status)) return res.status(400).send({ message: 'Estado inválido.' });
+    const dataToUpdate = { status, reviewedBy_id: req.user.uid, reviewedBy_name: req.user.name, reviewedAt: new Date() };
+    try { await db.collection('guilds').doc(guildId).collection('applications').doc(appId).update(dataToUpdate); res.status(200).send({ message: 'Decisión guardada.' }); }
+    catch (error) { console.error(error); res.status(500).send({ message: 'Error al guardar la decisión.' }); }
+});
 
-export default App;
+app.post('/api/guilds/:guildId/forms', verifyFirebaseToken, checkGuildAdmin, async (req, res) => {
+    const { guildId } = req.params; const { form } = req.body;
+    const docData = { ...form, createdBy_id: req.user.uid, createdBy_name: req.user.name, createdAt: admin.firestore.FieldValue.serverTimestamp() };
+    try { const docRef = await db.collection('guilds').doc(guildId).collection('forms').add(docData); res.status(201).send({ id: docRef.id }); }
+    catch (error) { console.error(error); res.status(500).send({ message: 'Error al crear el formulario.' }); }
+});
 
-                    
+app.put('/api/guilds/:guildId/forms/:formId', verifyFirebaseToken, checkGuildAdmin, async (req, res) => {
+    const { guildId, formId } = req.params; const { form } = req.body;
+    try { await db.collection('guilds').doc(guildId).collection('forms').doc(formId).set(form, { merge: true }); res.status(200).send({ message: 'Formulario actualizado.' }); }
+    catch (error) { console.error(error); res.status(500).send({ message: 'Error al actualizar el formulario.' }); }
+});
+
+app.delete('/api/guilds/:guildId/forms/:formId', verifyFirebaseToken, checkGuildAdmin, async (req, res) => {
+    const { guildId, formId } = req.params;
+    try { await db.collection('guilds').doc(guildId).collection('forms').doc(formId).delete(); res.status(200).send({ message: 'Formulario eliminado.' }); }
+    catch (error) { console.error(error); res.status(500).send({ message: 'Error al eliminar el formulario.' }); }
+});
+
+app.get('/api/guilds/:guildId/validate-role/:roleId', verifyFirebaseToken, checkGuildAdmin, async (req, res) => {
+    const { guildId, roleId } = req.params; if (!snowflakeRegex.test(roleId)) return res.status(400).json({ isValid: false, message: 'ID inválido.' });
+    try { const guild = await client.guilds.fetch(guildId); const role = await guild.roles.fetch(roleId); res.status(200).json({ isValid: !!role, message: role ? `Rol válido: ${role.name}` : 'El rol no existe.' }); }
+    catch (error) { res.status(200).json({ isValid: false, message: 'El rol no existe en este servidor.' }); }
+});
+
+app.post('/api/assign-roles', verifyFirebaseToken, checkGuildAdmin, async (req, res) => {
+    const { guildId, memberId, roles } = req.body; if (!guildId || !memberId || !Array.isArray(roles) || roles.length === 0) return res.status(400).send({ message: 'Faltan datos.' });
+    try { const guild = await client.guilds.fetch(guildId); const member = await guild.members.fetch(memberId); await member.roles.add(roles.filter(r => r)); res.status(200).send({ message: `Roles asignados.` }); }
+    catch (error) { console.error("Assign Role Error:", error); res.status(500).send({ message: "No se pudieron asignar los roles." }); }
+});
+
+app.post('/api/remove-roles', verifyFirebaseToken, checkGuildAdmin, async (req, res) => {
+    const { guildId, memberId, roles } = req.body; if (!guildId || !memberId || !Array.isArray(roles) || roles.length === 0) return res.status(400).send({ message: 'Faltan datos.' });
+    try { const guild = await client.guilds.fetch(guildId); const member = await guild.members.fetch(memberId); await member.roles.remove(roles.filter(r => r)); res.status(200).send({ message: `Roles eliminados.` }); }
+    catch (error) { console.error("Remove Role Error:", error); res.status(500).send({ message: "No se pudieron quitar los roles." }); }
+});
+
+app.post('/api/notify-user', verifyFirebaseToken, async (req, res) => {
+    const { memberId, message } = req.body; if (!snowflakeRegex.test(memberId) || !message) return res.status(400).send({ message: 'Faltan datos o son inválidos.' });
+    try { const user = await client.users.fetch(memberId); await user.send(message); res.status(200).send({ message: `Mensaje enviado a ${user.tag}` }); }
+    catch (error) { console.error("DM Error:", error); res.status(500).send({ message: "No se pudo enviar el DM." }); }
+});
+
+app.post('/api/set-premium', verifyFirebaseToken, checkGuildAdmin, async (req, res) => {
+    const { guildId, isPremium } = req.body; if (!snowflakeRegex.test(guildId) || typeof isPremium !== 'boolean') return res.status(400).send({ message: 'Datos inválidos.' });
+    try { await db.collection('guilds').doc(guildId).set({ isPremium }, { merge: true }); res.status(200).send({ message: `Estado premium actualizado.` }); }
+    catch (error) { console.error("Premium Error:", error); res.status(500).send({ message: 'Error al actualizar el estado premium.' }); }
+});
+
+// --- INICIO DEL SERVIDOR ---
+const PORT = process.env.PORT || 5001;
+app.listen(PORT, () => { console.log(`Backend escuchando en ${PORT}`); client.login(process.env.DISCORD_BOT_TOKEN); });
+
+        
